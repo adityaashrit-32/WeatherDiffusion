@@ -2,18 +2,13 @@ import math
 import torch
 import torch.nn as nn
 
-# This script is from the following repositories
+# This script is from the following repositories (modified):
 # https://github.com/ermongroup/ddim
 # https://github.com/bahjat-kawar/ddrm
 
-
 def get_timestep_embedding(timesteps, embedding_dim):
     """
-    This matches the implementation in Denoising Diffusion Probabilistic Models:
-    From Fairseq.
-    Build sinusoidal embeddings.
-    This matches the implementation in tensor2tensor, but differs slightly
-    from the description in Section 3.5 of "Attention Is All You Need".
+    Build sinusoidal timestep embeddings (same behavior as original).
     """
     assert len(timesteps.shape) == 1
 
@@ -30,7 +25,7 @@ def get_timestep_embedding(timesteps, embedding_dim):
 
 def nonlinearity(x):
     # swish
-    return x*torch.sigmoid(x)
+    return x * torch.sigmoid(x)
 
 
 def Normalize(in_channels):
@@ -78,9 +73,33 @@ class Downsample(nn.Module):
         return x
 
 
+class MultiScaleConv(nn.Module):
+    """
+    Multi-scale parallel dilated convolutions (dilations 1,2,4) then 1x1 projection.
+    Preserves input->output channel count (projects to out_channels).
+    """
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        # We'll split channels between branches then project back
+        mid_ch = max(16, out_ch // 3)
+        self.branch1 = nn.Conv2d(in_ch, mid_ch, kernel_size=3, padding=1, dilation=1)
+        self.branch2 = nn.Conv2d(in_ch, mid_ch, kernel_size=3, padding=2, dilation=2)
+        self.branch3 = nn.Conv2d(in_ch, mid_ch, kernel_size=3, padding=4, dilation=4)
+        total = mid_ch * 3
+        self.project = nn.Conv2d(total, out_ch, kernel_size=1, stride=1, padding=0)
+
+    def forward(self, x):
+        b1 = self.branch1(x)
+        b2 = self.branch2(x)
+        b3 = self.branch3(x)
+        cat = torch.cat([b1, b2, b3], dim=1)
+        out = self.project(cat)
+        return out
+
+
 class ResnetBlock(nn.Module):
     def __init__(self, *, in_channels, out_channels=None, conv_shortcut=False,
-                 dropout, temb_channels=512):
+                 dropout=0.0, temb_channels=512):
         super().__init__()
         self.in_channels = in_channels
         out_channels = in_channels if out_channels is None else out_channels
@@ -93,6 +112,10 @@ class ResnetBlock(nn.Module):
                                      kernel_size=3,
                                      stride=1,
                                      padding=1)
+
+        # multi-scale conv to enrich features (new)
+        self.msconv = MultiScaleConv(out_channels, out_channels)
+
         self.temb_proj = torch.nn.Linear(temb_channels,
                                          out_channels)
         self.norm2 = Normalize(out_channels)
@@ -122,6 +145,9 @@ class ResnetBlock(nn.Module):
         h = nonlinearity(h)
         h = self.conv1(h)
 
+        # multi-scale feature enrichment
+        h = self.msconv(h)
+
         h = h + self.temb_proj(nonlinearity(temb))[:, :, None, None]
 
         h = self.norm2(h)
@@ -135,30 +161,34 @@ class ResnetBlock(nn.Module):
             else:
                 x = self.nin_shortcut(x)
 
-        return x+h
+        return x + h
 
 
-class AttnBlock(nn.Module):
-    def __init__(self, in_channels):
+class AttnBlockMH(nn.Module):
+    """
+    Multi-Head Attention block operating on flattened spatial tokens using
+    nn.MultiheadAttention (batch_first=True).
+    """
+    def __init__(self, in_channels, num_heads=None):
         super().__init__()
         self.in_channels = in_channels
-
         self.norm = Normalize(in_channels)
-        self.q = torch.nn.Conv2d(in_channels,
-                                 in_channels,
-                                 kernel_size=1,
-                                 stride=1,
-                                 padding=0)
-        self.k = torch.nn.Conv2d(in_channels,
-                                 in_channels,
-                                 kernel_size=1,
-                                 stride=1,
-                                 padding=0)
-        self.v = torch.nn.Conv2d(in_channels,
-                                 in_channels,
-                                 kernel_size=1,
-                                 stride=1,
-                                 padding=0)
+
+        # choose number of heads reasonably (must divide channel dim for best perf)
+        if num_heads is None:
+            # heuristic: up to 8, but ensure in_channels % heads == 0; fallback to 1
+            preferred = min(8, max(1, in_channels // 64))
+            # find a divisor near preferred
+            heads = 1
+            for h in range(preferred, 0, -1):
+                if in_channels % h == 0:
+                    heads = h
+                    break
+            num_heads = heads
+        self.num_heads = num_heads
+        # MultiheadAttention accepts embed_dim=in_channels
+        self.mha = nn.MultiheadAttention(embed_dim=in_channels, num_heads=self.num_heads, batch_first=True)
+        # projection after attention (1x1 conv equivalent)
         self.proj_out = torch.nn.Conv2d(in_channels,
                                         in_channels,
                                         kernel_size=1,
@@ -167,30 +197,15 @@ class AttnBlock(nn.Module):
 
     def forward(self, x):
         h_ = x
-        h_ = self.norm(h_)
-        q = self.q(h_)
-        k = self.k(h_)
-        v = self.v(h_)
-
-        # compute attention
-        b, c, h, w = q.shape
-        q = q.reshape(b, c, h*w)
-        q = q.permute(0, 2, 1)   # b,hw,c
-        k = k.reshape(b, c, h*w)  # b,c,hw
-        w_ = torch.bmm(q, k)     # b,hw,hw    w[b,i,j]=sum_c q[b,i,c]k[b,c,j]
-        w_ = w_ * (int(c)**(-0.5))
-        w_ = torch.nn.functional.softmax(w_, dim=2)
-
-        # attend to values
-        v = v.reshape(b, c, h*w)
-        w_ = w_.permute(0, 2, 1)   # b,hw,hw (first hw of k, second of q)
-        # b, c,hw (hw of q) h_[b,c,j] = sum_i v[b,c,i] w_[b,i,j]
-        h_ = torch.bmm(v, w_)
-        h_ = h_.reshape(b, c, h, w)
-
-        h_ = self.proj_out(h_)
-
-        return x+h_
+        h_ = self.norm(h_)  # B,C,H,W
+        b, c, h, w = h_.shape
+        # flatten spatial -> tokens
+        tokens = h_.permute(0, 2, 3, 1).reshape(b, h*w, c)  # (B, L, C)
+        # MHA (batch_first=True)
+        attn_out, _ = self.mha(tokens, tokens, tokens, need_weights=False)  # (B, L, C)
+        attn_out = attn_out.reshape(b, h, w, c).permute(0, 3, 1, 2)  # (B, C, H, W)
+        out = self.proj_out(attn_out)
+        return x + out
 
 
 class DiffusionUNet(nn.Module):
@@ -206,7 +221,7 @@ class DiffusionUNet(nn.Module):
         resamp_with_conv = config.model.resamp_with_conv
 
         self.ch = ch
-        self.temb_ch = self.ch*4
+        self.temb_ch = self.ch * 4
         self.num_resolutions = len(ch_mult)
         self.num_res_blocks = num_res_blocks
         self.resolution = resolution
@@ -229,14 +244,14 @@ class DiffusionUNet(nn.Module):
                                        padding=1)
 
         curr_res = resolution
-        in_ch_mult = (1,)+ch_mult
+        in_ch_mult = (1,) + ch_mult
         self.down = nn.ModuleList()
         block_in = None
         for i_level in range(self.num_resolutions):
             block = nn.ModuleList()
             attn = nn.ModuleList()
-            block_in = ch*in_ch_mult[i_level]
-            block_out = ch*ch_mult[i_level]
+            block_in = ch * in_ch_mult[i_level]
+            block_out = ch * ch_mult[i_level]
             for i_block in range(self.num_res_blocks):
                 block.append(ResnetBlock(in_channels=block_in,
                                          out_channels=block_out,
@@ -244,11 +259,11 @@ class DiffusionUNet(nn.Module):
                                          dropout=dropout))
                 block_in = block_out
                 if curr_res in attn_resolutions:
-                    attn.append(AttnBlock(block_in))
+                    attn.append(AttnBlockMH(block_in))
             down = nn.Module()
             down.block = block
             down.attn = attn
-            if i_level != self.num_resolutions-1:
+            if i_level != self.num_resolutions - 1:
                 down.downsample = Downsample(block_in, resamp_with_conv)
                 curr_res = curr_res // 2
             self.down.append(down)
@@ -259,7 +274,7 @@ class DiffusionUNet(nn.Module):
                                        out_channels=block_in,
                                        temb_channels=self.temb_ch,
                                        dropout=dropout)
-        self.mid.attn_1 = AttnBlock(block_in)
+        self.mid.attn_1 = AttnBlockMH(block_in)
         self.mid.block_2 = ResnetBlock(in_channels=block_in,
                                        out_channels=block_in,
                                        temb_channels=self.temb_ch,
@@ -270,18 +285,18 @@ class DiffusionUNet(nn.Module):
         for i_level in reversed(range(self.num_resolutions)):
             block = nn.ModuleList()
             attn = nn.ModuleList()
-            block_out = ch*ch_mult[i_level]
-            skip_in = ch*ch_mult[i_level]
-            for i_block in range(self.num_res_blocks+1):
+            block_out = ch * ch_mult[i_level]
+            skip_in = ch * ch_mult[i_level]
+            for i_block in range(self.num_res_blocks + 1):
                 if i_block == self.num_res_blocks:
-                    skip_in = ch*in_ch_mult[i_level]
-                block.append(ResnetBlock(in_channels=block_in+skip_in,
+                    skip_in = ch * in_ch_mult[i_level]
+                block.append(ResnetBlock(in_channels=block_in + skip_in,
                                          out_channels=block_out,
                                          temb_channels=self.temb_ch,
                                          dropout=dropout))
                 block_in = block_out
                 if curr_res in attn_resolutions:
-                    attn.append(AttnBlock(block_in))
+                    attn.append(AttnBlockMH(block_in))
             up = nn.Module()
             up.block = block
             up.attn = attn
@@ -313,9 +328,11 @@ class DiffusionUNet(nn.Module):
             for i_block in range(self.num_res_blocks):
                 h = self.down[i_level].block[i_block](hs[-1], temb)
                 if len(self.down[i_level].attn) > 0:
-                    h = self.down[i_level].attn[i_block](h)
+                    # attn list might be smaller than num blocks; match by index if present
+                    attn_idx = i_block if i_block < len(self.down[i_level].attn) else -1
+                    h = self.down[i_level].attn[attn_idx](h)
                 hs.append(h)
-            if i_level != self.num_resolutions-1:
+            if i_level != self.num_resolutions - 1:
                 hs.append(self.down[i_level].downsample(hs[-1]))
 
         # middle
@@ -326,11 +343,12 @@ class DiffusionUNet(nn.Module):
 
         # upsampling
         for i_level in reversed(range(self.num_resolutions)):
-            for i_block in range(self.num_res_blocks+1):
+            for i_block in range(self.num_res_blocks + 1):
                 h = self.up[i_level].block[i_block](
                     torch.cat([h, hs.pop()], dim=1), temb)
                 if len(self.up[i_level].attn) > 0:
-                    h = self.up[i_level].attn[i_block](h)
+                    attn_idx = i_block if i_block < len(self.up[i_level].attn) else -1
+                    h = self.up[i_level].attn[attn_idx](h)
             if i_level != 0:
                 h = self.up[i_level].upsample(h)
 
